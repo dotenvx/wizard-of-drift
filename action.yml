@@ -1,5 +1,8 @@
 name: "Wizard of Drift (Oz and Dotenvx)"
 description: "Checks .env* drift with Warp Oz agents"
+branding:
+  icon: "shield"
+  color: "yellow"
 inputs:
   warp_api_key:
     description: "Warp API key"
