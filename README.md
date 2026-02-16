@@ -1,6 +1,6 @@
-# Wizard of Drift
+[![oz and dotenvx](https://dotenvx.com/assets/img/oz/oz-plus-dotenvx.png)](https://warp.dev/oz)
 
-Checks `.env*` key drift on pull requests with Warp Agent and posts a PR review comment.
+> Wizard of Drift - Checks `.env*` key drift on pull requests with Warp Agent and posts a PR review comment.
 
 ## Inputs
 
