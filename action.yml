@@ -1,0 +1,216 @@
+name: "Wizard of Drift (Oz and Dotenvx)"
+description: "Checks .env* drift with Warp Oz agents"
+inputs:
+  warp_api_key:
+    description: "Warp API key"
+    required: true
+  warp_agent_profile:
+    description: "Optional Warp Agent profile"
+    required: false
+    default: ""
+  github_token:
+    description: "GitHub token for PR API calls"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Prepare Env Drift Context
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "# Env Drift Context" > env_drift_context.md
+
+        mapfile -t env_files < <(find . -type f -name '.env*' ! -name '.env.keys' | sort)
+
+        if [ "${#env_files[@]}" -eq 0 ]; then
+          echo "No .env* files found." >> env_drift_context.md
+          exit 0
+        fi
+
+        echo "## Files" >> env_drift_context.md
+        printf -- "- %s\n" "${env_files[@]}" >> env_drift_context.md
+
+        expected_public_key_for_file() {
+          local file="$1"
+          local base
+          base="$(basename "$file")"
+
+          if [ "$base" = ".env" ]; then
+            echo "DOTENV_PUBLIC_KEY"
+            return
+          fi
+
+          if [[ "$base" == .env.* ]]; then
+            local suffix="${base#.env.}"
+            suffix="$(echo "$suffix" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+            suffix="$(echo "$suffix" | sed 's/^_*//; s/_*$//')"
+            echo "DOTENV_PUBLIC_KEY_${suffix}"
+            return
+          fi
+
+          echo "DOTENV_PUBLIC_KEY"
+        }
+
+        extract_keys() {
+          local file="$1"
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+            {
+              line = $0
+              sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+              if (match(line, /^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=/, m)) print m[1]
+            }
+          ' "$file" | sort -u
+        }
+
+        tmp_dir="$(mktemp -d)"
+        trap 'rm -rf "$tmp_dir"' EXIT
+
+        declare -A key_file_by_env
+        declare -A all_keys
+
+        for env_file in "${env_files[@]}"; do
+          key_file="$tmp_dir/$(echo "$env_file" | tr '/.' '__').keys"
+          extract_keys "$env_file" > "$key_file"
+          key_file_by_env["$env_file"]="$key_file"
+
+          while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            if [[ "$key" =~ ^DOTENV_PUBLIC_KEY(_[A-Z0-9_]+)?$ ]]; then
+              continue
+            fi
+            all_keys["$key"]=1
+          done < "$key_file"
+        done
+
+        echo "" >> env_drift_context.md
+        echo "## Special Key Rule" >> env_drift_context.md
+        echo "- .env -> DOTENV_PUBLIC_KEY" >> env_drift_context.md
+        echo "- .env.<target> -> DOTENV_PUBLIC_KEY_<TARGET_UPPERCASE>" >> env_drift_context.md
+
+        echo "" >> env_drift_context.md
+        echo "## Missing Keys By File" >> env_drift_context.md
+
+        missing_any=0
+        for env_file in "${env_files[@]}"; do
+          missing_keys=""
+          key_file="${key_file_by_env[$env_file]}"
+
+          for key in "${!all_keys[@]}"; do
+            if ! grep -Fxq "$key" "$key_file"; then
+              missing_keys+="$key "
+            fi
+          done
+
+          expected_public_key="$(expected_public_key_for_file "$env_file")"
+          if ! grep -Fxq "$expected_public_key" "$key_file"; then
+            missing_keys+="$expected_public_key "
+          fi
+
+          missing_keys="$(echo "$missing_keys" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+          if [ -n "$missing_keys" ]; then
+            missing_any=1
+            echo "- $env_file: $missing_keys" >> env_drift_context.md
+          fi
+        done
+
+        if [ "$missing_any" -eq 0 ]; then
+          echo "- No drift detected" >> env_drift_context.md
+        fi
+
+        echo "" >> env_drift_context.md
+        echo "## PR Diff (.env* only)" >> env_drift_context.md
+        git diff "${{ github.event.pull_request.base.sha }}...HEAD" -- '.env*' ':(exclude).env.keys' >> env_drift_context.md || true
+
+    - name: Construct Warp Prompt
+      id: prompt
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const pr = context.payload.pull_request;
+          const contextDoc = fs.existsSync('env_drift_context.md')
+            ? fs.readFileSync('env_drift_context.md', 'utf8')
+            : 'No env context available.';
+
+          const prompt = `Review env drift for PR #${pr.number}.
+
+          Title: ${pr.title}
+          Description: ${pr.body || 'No description provided.'}
+
+          Rules:
+          - Scope only to .env* files and exclude .env.keys.
+          - Compare keys only, not values.
+          - Treat DOTENV_PUBLIC_KEY keys as file-specific:
+            - .env => DOTENV_PUBLIC_KEY
+            - .env.<target> => DOTENV_PUBLIC_KEY_<TARGET_UPPERCASE>
+          - Suggest exact missing key lines to add.
+
+          Context:
+          ${contextDoc}
+
+          Write review.json with this schema:
+          {
+            "summary": "markdown summary with findings and concrete fixes",
+            "comments": []
+          }
+
+          Keep output concise and actionable.`;
+
+          core.setOutput('prompt', prompt);
+
+    - name: Run Warp Agent Env Drift Review
+      uses: warpdotdev/warp-agent-action@v1
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      with:
+        prompt: ${{ steps.prompt.outputs.prompt }}
+        warp_api_key: ${{ inputs.warp_api_key }}
+        profile: ${{ inputs.warp_agent_profile }}
+
+    - name: Post Review Summary
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const { owner, repo } = context.repo;
+          const pull_number = context.payload.pull_request.number;
+
+          if (!fs.existsSync('review.json')) {
+            console.log('No review.json found. Skipping review posting.');
+            return;
+          }
+
+          let body = '';
+          const raw = fs.readFileSync('review.json', 'utf8');
+
+          try {
+            const parsed = JSON.parse(raw);
+            body = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+          } catch (err) {
+            core.warning(`review.json parse failed: ${err.message}`);
+            body = raw.trim();
+          }
+
+          if (!body) {
+            console.log('No summary content found in review.json. Skipping review posting.');
+            return;
+          }
+
+          await github.rest.pulls.createReview({
+            owner,
+            repo,
+            pull_number,
+            event: 'COMMENT',
+            body,
+          });
